@@ -1,4 +1,4 @@
-# mx4ctl — Logitech MX Master 4 haptics & extras for Linux
+# Logitech MX Master 4 haptics & extras for Linux
 
 The MX Master 4's headline features (haptic feedback, the thumb-panel
 "Actions Ring" button) only work with Logi Options+, which doesn't exist on
@@ -93,22 +93,6 @@ re-login) so the uinput permission takes effect.
 See `config.example.ini` — thumb-button actions (`menu`/`command`/`none`,
 long-press timing), the popup-menu entries, per-app notification waveforms,
 and battery warning threshold.
-
-## Fun ideas
-
-Buzz when a long build finishes:
-
-```
-make && mx4ctl play completed || mx4ctl play mad
-```
-
-Claude Code hook (`~/.claude/settings.json`) so the mouse knocks when a
-task finishes or input is needed:
-
-```json
-{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mx4ctl play knock"}]}],
-           "Notification": [{"hooks": [{"type": "command", "command": "mx4ctl play happy_alert"}]}]}}
-```
 
 ## Protocol notes (HID++ 2.0)
 
