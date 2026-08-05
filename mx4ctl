@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+import pathlib
+import sys
+
+here = pathlib.Path(__file__).resolve().parent
+for base in (here, pathlib.Path("/usr/lib/mx4ctl")):
+    if (base / "mx4").is_dir():
+        sys.path.insert(0, str(base))
+        break
+from mx4.cli import main  # noqa: E402
+
+sys.exit(main())
