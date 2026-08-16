@@ -54,9 +54,28 @@ cd mx4_linux
 ./mx4-wizard
 ```
 
-On first run it checks whether this user can talk to the mouse, and if not,
-offers to install the udev rule for you (one `sudo`, once). Then tune, press
-`s`, and you're done — no package, no daemon, standard library only.
+Every run checks its own setup and completes only what is missing, so it is
+safe to run again at any time:
+
+```
+mx4-wizard --check     # report setup state, exit non-zero if incomplete
+mx4-wizard --setup     # complete the missing steps, then exit
+```
+
+```
+  Setup
+    ✓ device access          hidraw node is readable
+    ✗ restore on reconnect   settings will not come back when the receiver is replugged
+    ✓ restore at login       mx4ctl-restore.service enabled
+    ✓ on PATH                ~/.local/bin/mx4-wizard
+    ✓ settings saved         ~/.config/mx4ctl/settings.conf
+
+  1 step(s) to complete (one sudo for the system ones).
+  Do it now? [Y/n]
+```
+
+The steps that need root are batched into a single `sudo` call. Then tune,
+press `s`, and you're done — no package, no daemon, standard library only.
 
 ```
   MX Master 4 — settings   changes apply live
