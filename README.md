@@ -42,6 +42,54 @@ mx4ctl watch gesture       # debug: print a button's press/release events
 mx4ctl daemon -v           # run the daemon in the foreground
 ```
 
+### Interactive tuning — `mx4-wizard`
+
+DPI, ratchet torque and the thumb-button force threshold are things you pick
+by feel, not by number, and they're split between the mouse and GNOME.
+`mx4-wizard` puts them on one screen. Nothing to install:
+
+```
+git clone https://github.com/A-Common-Guy/mx4_linux
+cd mx4_linux
+./mx4-wizard
+```
+
+On first run it checks whether this user can talk to the mouse, and if not,
+offers to install the udev rule for you (one `sudo`, once). Then tune, press
+`s`, and you're done — no package, no daemon, standard library only.
+
+```
+  MX Master 4 — settings   changes apply live
+
+  POINTER
+    · DPI                                1600  █████·······················
+      Pointer speed                      +0.0  ██████████████··············
+      Acceleration         adaptive (default)
+
+  WHEEL
+    · Mode                   ratchet (clicky)
+  ▸ · Torque                               50  ██████████████··············
+    · Auto-disengage                      off  ····························
+      Natural scrolling                    off
+
+  THUMB BUTTON
+    · Force threshold                    6342  ███████████·················
+    · Haptic level                         60  █████████████████···········
+```
+
+`↑↓` selects, `←→` adjusts, `⇧←→` takes bigger steps. Every change is written
+to the mouse immediately, so you keep moving it and spinning the wheel while
+you tune. `esc` reverts everything and quits; `q` keeps the changes for this
+session without saving.
+
+Settings marked `·` live in the mouse's volatile memory and are lost when it
+power-cycles. Pressing `s` records them to `~/.config/mx4ctl/settings.conf`
+and enables a `mx4ctl-restore.service` user unit that replays them at login
+(it exits quietly when the mouse is asleep). The unmarked rows are GNOME
+settings, which persist on their own.
+
+The wizard is standalone — it needs no daemon, and works fine alongside one.
+
 ## Install
 
 ### As a package (recommended — Ubuntu 20.04+)
