@@ -310,7 +310,6 @@ After=graphical-session.target
 [Service]
 Type=oneshot
 ExecStart={here}/mx4-wizard --restore
-RemainAfterExit=yes
 
 [Install]
 WantedBy=graphical-session.target
@@ -335,18 +334,26 @@ def restore():
                 vals[k.strip()] = int(v.strip())
             except ValueError:
                 pass
-    try:
-        m = MX4(hidpp.find_device())
-        m.set_ratchet(mode=vals.get("mode", 0), speed=vals.get("speed", 0),
-                      torque=vals.get("torque", 0))
-        if vals.get("dpi"):
-            m.set_dpi(vals["dpi"])
-        if vals.get("force"):
-            m.set_force(vals["force"])
-        if "haptic" in vals:
-            m.set_haptic_level(vals["haptic"])
-    except Exception as e:                      # mouse asleep at login is normal
-        print(f"mx4-wizard: {e}", file=sys.stderr)
+    # When udev triggers this on reconnect we can arrive before the device is
+    # settled or before uaccess has granted the ACL, so retry for a few seconds.
+    import time
+    last = None
+    for attempt in range(10):
+        try:
+            m = MX4(hidpp.find_device())
+            m.set_ratchet(mode=vals.get("mode", 0), speed=vals.get("speed", 0),
+                          torque=vals.get("torque", 0))
+            if vals.get("dpi"):
+                m.set_dpi(vals["dpi"])
+            if vals.get("force"):
+                m.set_force(vals["force"])
+            if "haptic" in vals:
+                m.set_haptic_level(vals["haptic"])
+            return 0
+        except Exception as e:
+            last, _ = e, time.sleep(0.5 if attempt else 0.1)
+    # a mouse that is simply switched off is normal, not a failure
+    print(f"mx4-wizard: settings not applied: {last}", file=sys.stderr)
     return 0
 
 
@@ -387,6 +394,10 @@ RULE_TEXT = (
     '# Logitech HID++ devices readable by the logged-in user (mx4ctl / mx4-wizard)\n'
     'ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", MODE="0660", TAG+="uaccess"\n'
     'ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:046D:*", MODE="0660", TAG+="uaccess"\n'
+    '# re-apply saved settings when the receiver reappears — DPI is volatile and\n'
+    '# is lost whenever the mouse drops its connection (replugged dongle, dock, ...)\n'
+    'ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", TAG+="systemd", '
+    'ENV{SYSTEMD_USER_WANTS}+="mx4ctl-restore.service"\n'
 )
 
 
