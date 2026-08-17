@@ -46,7 +46,9 @@ mx4ctl daemon -v           # run the daemon in the foreground
 
 DPI, ratchet torque and the thumb-button force threshold are things you pick
 by feel, not by number, and they're split between the mouse and GNOME.
-`mx4-wizard` puts them on one screen. Nothing to install:
+`mx4-wizard` puts them on one screen. Installing the .deb or running
+`install.sh` puts it on your PATH; it also runs straight from a checkout —
+nothing to install:
 
 ```
 git clone https://github.com/A-Common-Guy/mx4_linux
@@ -113,17 +115,28 @@ The wizard is standalone — it needs no daemon, and works fine alongside one.
 
 ### As a package (recommended — Ubuntu 20.04+)
 
+Grab the latest `.deb` from the
+[releases page](https://github.com/A-Common-Guy/mx4_linux/releases) —
+every push to `main` builds, tests and publishes one, with a changelog —
+or build it yourself:
+
 ```
 ./packaging/build-deb.sh              # → dist/mx4ctl_<version>_all.deb
 sudo apt install ./dist/mx4ctl_*.deb  # on any machine
 ```
 
-The package installs the CLI to `/usr/bin/mx4ctl`, a udev rule granting
-logged-in users access to Logitech hidraw devices (receiver and
-Bluetooth), and enables the daemon for all graphical sessions — it starts
-at next login, or immediately with `systemctl --user start mx4ctl`. On
-first run the daemon creates `~/.config/mx4ctl/config.ini` from the
-packaged example; edit it and `systemctl --user restart mx4ctl`.
+The package installs the CLI to `/usr/bin/mx4ctl` and the wizard to
+`/usr/bin/mx4-wizard`, a udev rule granting logged-in users access to
+Logitech hidraw devices (receiver and Bluetooth), and enables the daemon
+for all graphical sessions — it starts at next login, or immediately with
+`systemctl --user start mx4ctl`. On first run the daemon creates
+`~/.config/mx4ctl/config.ini` from the packaged example; edit it and
+`systemctl --user restart mx4ctl`.
+
+The wizard's setup comes with the package too: the udev rule replays saved
+settings whenever the mouse (re)appears, and `mx4ctl-restore.service` is
+enabled for all users — so `mx4-wizard` needs no sudo step, just run it
+and tune.
 
 **Uninstall:** `sudo apt remove mx4ctl` (per-user configs in
 `~/.config/mx4ctl` stay; delete them by hand if wanted).
@@ -134,9 +147,10 @@ packaged example; edit it and `systemctl --user restart mx4ctl`.
 ./install.sh
 ```
 
-Symlinks `mx4ctl` into `~/.local/bin`, copies `config.example.ini` to
-`~/.config/mx4ctl/config.ini`, and enables a systemd user service pointing
-at the repo. Remove with `systemctl --user disable --now mx4ctl`.
+Symlinks `mx4ctl` and `mx4-wizard` into `~/.local/bin`, copies
+`config.example.ini` to `~/.config/mx4ctl/config.ini`, and enables a
+systemd user service pointing at the repo. Remove with
+`systemctl --user disable --now mx4ctl`.
 
 ### X11 and Wayland
 

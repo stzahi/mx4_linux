@@ -3,7 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION=$(python3 -c "import mx4; print(mx4.__version__)")
+# CI overrides this to add a package revision (0.4.0-1) when re-releasing
+VERSION=${MX4_VERSION:-$(python3 -c "import mx4; print(mx4.__version__)")}
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
@@ -14,6 +15,7 @@ install -d "$STAGE/usr/lib/mx4ctl/mx4" "$STAGE/usr/bin" \
 
 install -m 644 mx4/*.py "$STAGE/usr/lib/mx4ctl/mx4/"
 install -m 755 mx4ctl "$STAGE/usr/bin/mx4ctl"
+install -m 755 mx4-wizard "$STAGE/usr/bin/mx4-wizard"
 install -m 644 config.example.ini "$STAGE/usr/share/mx4ctl/"
 install -m 644 README.md "$STAGE/usr/share/doc/mx4ctl/"
 
@@ -32,12 +34,28 @@ RestartSec=5
 WantedBy=graphical-session.target
 EOF
 
+cat > "$STAGE/usr/lib/systemd/user/mx4ctl-restore.service" <<'EOF'
+[Unit]
+Description=Restore MX Master 4 settings
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/mx4-wizard --restore
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+
 # hidraw access for logged-in users (USB receiver and Bluetooth), and
-# uinput for the virtual keyboard that backs @built-in actions on Wayland
+# uinput for the virtual keyboard that backs @built-in actions on Wayland.
+# The mouse-side settings saved by mx4-wizard are volatile, so replay them
+# whenever the device (re)appears.
 cat > "$STAGE/usr/lib/udev/rules.d/42-mx4ctl.rules" <<'EOF'
 ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", MODE="0660", TAG+="uaccess"
 ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:046D:*", MODE="0660", TAG+="uaccess"
 KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uinput"
+ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="mx4ctl-restore.service"
 EOF
 
 # -- control files ----------------------------------------------------------
@@ -55,7 +73,8 @@ Description: Logitech MX Master 4 haptics & extras for Linux
  Talks HID++ 2.0 directly to the MX Master 4: haptic waveforms,
  notification buzz, mouse gestures, thumb-button actions menu,
  DPI and SmartShift control, battery warnings. CLI plus a per-user
- daemon (enabled automatically for graphical sessions).
+ daemon (enabled automatically for graphical sessions), and
+ mx4-wizard, an interactive settings tuner.
 EOF
 
 cat > "$STAGE/DEBIAN/postinst" <<'EOF'
@@ -64,7 +83,7 @@ set -e
 if [ "$1" = "configure" ]; then
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger --subsystem-match=hidraw 2>/dev/null || true
-    systemctl --global enable mx4ctl.service 2>/dev/null || true
+    systemctl --global enable mx4ctl.service mx4ctl-restore.service 2>/dev/null || true
 fi
 EOF
 
@@ -72,7 +91,7 @@ cat > "$STAGE/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
 set -e
 if [ "$1" = "remove" ]; then
-    systemctl --global disable mx4ctl.service 2>/dev/null || true
+    systemctl --global disable mx4ctl.service mx4ctl-restore.service 2>/dev/null || true
 fi
 EOF
 

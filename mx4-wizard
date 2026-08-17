@@ -14,6 +14,7 @@ their own.
 import os
 import pathlib
 import select
+import shutil
 import subprocess
 import sys
 import termios
@@ -491,15 +492,16 @@ udevadm control --reload-rules
         ),
         Step(
             "restore at login",
-            lambda: UNIT.exists() and unit_enabled(),
+            # enabled per-user by the wizard, or globally by the .deb
+            unit_enabled,
             f"{UNIT_NAME} enabled",
             "saved settings will not be re-applied at login",
             user_fix=write_unit,
         ),
         Step(
             "on PATH",
-            lambda: BIN_LINK.is_symlink() or BIN_LINK.exists(),
-            f"{BIN_LINK}",
+            lambda: shutil.which("mx4-wizard") is not None,
+            shutil.which("mx4-wizard") or str(BIN_LINK),
             "run it as ./mx4-wizard, or link it",
             user_fix=link_into_path,
         ),

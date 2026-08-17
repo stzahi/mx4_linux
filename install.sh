@@ -5,10 +5,15 @@ cd "$(dirname "$0")"
 
 mkdir -p ~/.local/bin ~/.config/mx4ctl ~/.config/systemd/user
 ln -sf "$PWD/mx4ctl" ~/.local/bin/mx4ctl
+ln -sf "$PWD/mx4ctl" ~/.local/bin/mx4
+ln -sf "$PWD/mx4-wizard" ~/.local/bin/mx4-wizard
 [ -f ~/.config/mx4ctl/config.ini ] || cp config.example.ini ~/.config/mx4ctl/config.ini
-cp mx4ctl.service ~/.config/systemd/user/
+# point the unit at wherever this checkout actually lives
+sed "s|^ExecStart=.*|ExecStart=$PWD/mx4ctl daemon|" mx4ctl.service > ~/.config/systemd/user/mx4ctl.service
 systemctl --user daemon-reload
-systemctl --user enable --now mx4ctl.service
+systemctl --user enable mx4ctl.service
+systemctl --user restart mx4ctl.service
 
 echo "installed. status: systemctl --user status mx4ctl"
 echo "config:    ~/.config/mx4ctl/config.ini (restart with: systemctl --user restart mx4ctl)"
+echo "tuning:    mx4-wizard (interactive settings tuner)"
