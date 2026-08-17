@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+"""Interactive settings tuner for the MX Master 4.
+
+Covers everything worth tuning by feel: pointer (DPI, acceleration), scroll
+wheel (ratchet, torque, auto-disengage) and the thumb button's force
+threshold. Changes apply to the mouse immediately, so you can move it and
+spin the wheel while you adjust. Nothing is persisted until you press `s`.
+
+Settings marked with a dot live in the mouse's volatile memory and are lost
+when it power-cycles; saving records them and enables a systemd user unit
+that replays them at login. The rest are GNOME settings, which persist on
+their own.
+"""
+import os
+import pathlib
+import select
+import subprocess
+import sys
+import termios
+import tty
+
+here = pathlib.Path(__file__).resolve().parent
+for base in (here, pathlib.Path("/usr/lib/mx4ctl")):
+    if (base / "mx4").is_dir():
+        sys.path.insert(0, str(base))
+        break
+
+from mx4 import hidpp  # noqa: E402
+from mx4.mouse import MX4  # noqa: E402
+
+CONF_DIR = pathlib.Path.home() / ".config" / "mx4ctl"
+CONF = CONF_DIR / "settings.conf"
+LEGACY_CONF = CONF_DIR / "wheel.conf"
+UNIT_NAME = "mx4ctl-restore.service"
+UNIT = pathlib.Path.home() / ".config" / "systemd" / "user" / UNIT_NAME
+
+SCHEMA = "org.gnome.desktop.peripherals.mouse"
+RATCHET, FREESPIN = 2, 1
+SPEED_OFF = 255          # what the mouse reports when auto-disengage is disabled
+
+BOLD, DIM, OFF, REV = "\033[1m", "\033[2m", "\033[0m", "\033[7m"
+CYAN, GREEN, YELLOW, GREY = "\033[36m", "\033[32m", "\033[33m", "\033[90m"
+
+
+# --------------------------------------------------------------------------
+# GNOME settings (dconf) — read/written through the gsettings CLI so this
+# script keeps working without PyGObject.
+
+def gget(key):
+    out = subprocess.run(["gsettings", "get", SCHEMA, key],
+                         capture_output=True, text=True).stdout.strip()
+    return out.strip("'")
+
+
+def gset(key, value):
+    subprocess.run(["gsettings", "set", SCHEMA, key, str(value)],
+                   capture_output=True)
+
+
+# --------------------------------------------------------------------------
+# Setting types
+
+class Setting:
+    """One tunable row. `onboard` means it lives in the mouse, not in dconf."""
+
+    onboard = True
+
+    def __init__(self, label, hint=""):
+        self.label, self.hint = label, hint
+
+    def text(self):
+        raise NotImplementedError
+
+    def bar(self):
+        return None
+
+    def adjust(self, steps, big=False):
+        pass
+
+
+class Num(Setting):
+    def __init__(self, label, lo, hi, step, big, get, set_,
+                 hint="", fmt=None, onboard=True, off_value=None, off_at=None):
+        super().__init__(label, hint)
+        self.lo, self.hi, self.step, self.big = lo, hi, step, big
+        self._get, self._set = get, set_
+        self.fmt = fmt or (lambda v: str(v))
+        self.onboard = onboard
+        self.off_value = off_value      # sentinel meaning "disabled"
+        self.off_at = off_at            # value to jump to when leaving "off"
+
+    @property
+    def value(self):
+        return self._get()
+
+    def is_off(self):
+        return self.off_value is not None and self.value == self.off_value
+
+    def text(self):
+        return f"{YELLOW}off{OFF}" if self.is_off() else self.fmt(self.value)
+
+    def bar(self):
+        if self.is_off():
+            return f"{DIM}{'·' * 28}{OFF}"
+        frac = (self.value - self.lo) / (self.hi - self.lo)
+        filled = round(max(0.0, min(1.0, frac)) * 28)
+        return f"{CYAN}{'█' * filled}{DIM}{'·' * (28 - filled)}{OFF}"
+
+    def adjust(self, steps, big=False):
+        if self.is_off():
+            if steps > 0:
+                self._set(self.off_at if self.off_at is not None else self.lo)
+            return
+        delta = (self.big if big else self.step) * steps
+        new = self.value + delta
+        if self.off_value is not None and new < self.lo:
+            self._set(self.off_value)               # step below minimum = off
+            return
+        self._set(max(self.lo, min(self.hi, new)))
+
+
+class Choice(Setting):
+    def __init__(self, label, options, get, set_, hint="", onboard=True):
+        super().__init__(label, hint)
+        self.options = options          # list of (value, display)
+        self._get, self._set = get, set_
+        self.onboard = onboard
+
+    def text(self):
+        cur = self._get()
+        for value, display in self.options:
+            if value == cur:
+                return f"{GREEN}{display}{OFF}"
+        return str(cur)
+
+    def adjust(self, steps, big=False):
+        cur = self._get()
+        values = [v for v, _ in self.options]
+        i = values.index(cur) if cur in values else 0
+        self._set(values[(i + steps) % len(values)])
+
+
+# --------------------------------------------------------------------------
+
+class Wizard:
+    def __init__(self, mouse):
+        self.m = mouse
+        self.mode, self.speed, self.torque = mouse.ratchet()
+        self._dpi = mouse.dpi()
+        self.force = mouse.force_button_info()
+        # the mouse keeps a level even while disabled; collapse that to 0 so
+        # "off" is a value on the same scale rather than a hidden second flag
+        enabled, level = mouse.haptic_level()
+        self._haptic = level if enabled else 0
+        self.original = self.snapshot()
+        self.rows, self.groups = self.build(mouse)
+
+    # -- mouse-side state, mirrored on every change -------------------------
+    def push_ratchet(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+        self.m.set_ratchet(mode=self.mode, speed=self.speed, torque=self.torque)
+
+    def set_dpi(self, v):
+        self._dpi = v
+        self.m.set_dpi(v)
+
+    def set_force(self, v):
+        self.force["current"] = v
+        self.m.set_force(v)
+
+    def set_haptic(self, v):
+        self._haptic = v
+        self.m.set_haptic_level(v)
+
+    def snapshot(self):
+        return {"dpi": self._dpi, "mode": self.mode, "speed": self.speed,
+                "torque": self.torque, "force": self.force["current"],
+                "haptic": self._haptic}
+
+    def build(self, m):
+        dpis = m.dpi_list()
+        f = self.force
+        groups, rows = [], []
+
+        def group(title, items):
+            groups.append((title, len(rows)))
+            rows.extend(items)
+
+        group("POINTER", [
+            Num("DPI", dpis[0], dpis[-1], 50, 500,
+                lambda: self._dpi, self.set_dpi,
+                hint="sensor resolution — counts per inch of desk travel"),
+            Num("Pointer speed", -10, 10, 1, 5,
+                lambda: round(float(gget("speed")) * 10),
+                lambda v: gset("speed", round(v / 10, 1)),
+                hint="GNOME software acceleration on top of DPI",
+                fmt=lambda v: f"{v / 10:+.1f}", onboard=False),
+            Choice("Acceleration", [("default", "adaptive (default)"),
+                                    ("flat", "flat — no acceleration"),
+                                    ("adaptive", "adaptive")],
+                   lambda: gget("accel-profile"),
+                   lambda v: gset("accel-profile", v),
+                   hint="flat = cursor strictly proportional to hand movement",
+                   onboard=False),
+        ])
+
+        group("WHEEL", [
+            Choice("Mode", [(RATCHET, "ratchet (clicky)"), (FREESPIN, "freespin (smooth)")],
+                   lambda: self.mode, lambda v: self.push_ratchet(mode=v),
+                   hint="detents, or a wheel that spins free"),
+            Num("Torque", 1, 100, 1, 5,
+                lambda: self.torque, lambda v: self.push_ratchet(torque=v),
+                hint="how hard the detents resist your finger"),
+            Num("Auto-disengage", 1, 50, 1, 5,
+                lambda: self.speed, lambda v: self.push_ratchet(speed=v),
+                hint="flick harder than this and the wheel drops into freespin",
+                off_value=SPEED_OFF, off_at=10),
+            Choice("Natural scrolling", [("false", "off"), ("true", "on")],
+                   lambda: gget("natural-scroll"),
+                   lambda v: gset("natural-scroll", v),
+                   hint="invert scroll direction", onboard=False),
+        ])
+
+        button = [
+            Num("Haptic level", 0, 100, 5, 20,
+                lambda: self._haptic, self.set_haptic,
+                hint="vibration strength — 0 turns haptics off entirely"),
+        ]
+        if f["changeable"]:
+            button.insert(0, Num(
+                "Force threshold", f["min"], f["max"], 50, 250,
+                lambda: self.force["current"], self.set_force,
+                hint=f"how hard you press the thumb panel (default {f['default']})"))
+        group("THUMB BUTTON", button)
+
+        return rows, groups
+
+    def revert(self):
+        o = self.original
+        self.set_dpi(o["dpi"])
+        self.push_ratchet(mode=o["mode"], speed=o["speed"], torque=o["torque"])
+        try:
+            self.set_force(o["force"])
+        except Exception:
+            pass
+        self.set_haptic(o["haptic"])
+
+
+# --------------------------------------------------------------------------
+
+def visible_len(s):
+    """Length of `s` ignoring ANSI escapes, so columns line up when colored."""
+    n, i = 0, 0
+    while i < len(s):
+        if s[i] == "\033":
+            while i < len(s) and s[i] not in "m":
+                i += 1
+        else:
+            n += 1
+        i += 1
+    return n
+
+
+def rpad(s, width):
+    return " " * max(0, width - visible_len(s)) + s
+
+
+def draw(w, sel, message=""):
+    out = ["\033[H\033[J"]
+    out.append(f"{BOLD}  MX Master 4 — settings{OFF}   {DIM}changes apply live{OFF}\n")
+
+    starts = {i: t for t, i in w.groups}
+    for i, row in enumerate(w.rows):
+        if i in starts:
+            out.append(f"\n  {BOLD}{GREY}{starts[i]}{OFF}")
+        cursor = f"{CYAN}▸{OFF}" if i == sel else " "
+        mark = f"{GREY}·{OFF}" if row.onboard else " "
+        label = f"{BOLD}{row.label}{OFF}" if i == sel else row.label
+        label += " " * max(0, 16 - len(row.label))
+        line = f"  {cursor} {mark} {label} {rpad(row.text(), 22)}"
+        if bar := row.bar():
+            line += f"  {bar}"
+        out.append(line)
+
+    out.append(f"\n  {DIM}{w.rows[sel].hint}{OFF}")
+    out.append(f"\n  {DIM}{'─' * 72}{OFF}")
+    out.append(f"  {BOLD}↑↓{OFF} select   {BOLD}←→{OFF} adjust   "
+               f"{BOLD}⇧←→{OFF} bigger step   {BOLD}s{OFF} save   "
+               f"{BOLD}q{OFF} quit   {BOLD}esc{OFF} revert")
+    out.append(f"  {GREY}·{OFF} {DIM}= stored in the mouse; saving replays it at login{OFF}")
+    if message:
+        out.append(f"\n  {GREEN}{message}{OFF}")
+    sys.stdout.write("\n".join(out))
+    sys.stdout.flush()
+
+
+def save(w):
+    s = w.snapshot()
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    CONF.write_text(
+        f"# written by mx4-wizard; replayed at login by {UNIT_NAME}\n"
+        + "".join(f"{k}={v}\n" for k, v in s.items())
+    )
+    write_unit()
+    if LEGACY_CONF.exists():
+        LEGACY_CONF.unlink()
+    return f"saved to {CONF}  ·  replayed at every login"
+
+
+def restore():
+    """--restore: replay saved mouse-side settings (used by the systemd unit)."""
+    path = CONF if CONF.exists() else LEGACY_CONF
+    if not path.exists():
+        return 0
+    vals = {}
+    for line in path.read_text().splitlines():
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            try:
+                vals[k.strip()] = int(v.strip())
+            except ValueError:
+                pass
+    # When udev triggers this on reconnect we can arrive before the device is
+    # settled or before uaccess has granted the ACL, so retry for a few seconds.
+    import time
+    last = None
+    for attempt in range(10):
+        try:
+            m = MX4(hidpp.find_device())
+            m.set_ratchet(mode=vals.get("mode", 0), speed=vals.get("speed", 0),
+                          torque=vals.get("torque", 0))
+            if vals.get("dpi"):
+                m.set_dpi(vals["dpi"])
+            if vals.get("force"):
+                m.set_force(vals["force"])
+            if "haptic" in vals:
+                m.set_haptic_level(vals["haptic"])
+            return 0
+        except Exception as e:
+            last, _ = e, time.sleep(0.5 if attempt else 0.1)
+    # a mouse that is simply switched off is normal, not a failure
+    print(f"mx4-wizard: settings not applied: {last}", file=sys.stderr)
+    return 0
+
+
+KEYS = {"[A": "up", "[B": "down", "[C": "right", "[D": "left",
+        "[1;2C": "sright", "[1;2D": "sleft",
+        "[1;2A": "up", "[1;2B": "down"}
+
+
+def read_key(fd):
+    ch = os.read(fd, 1).decode(errors="ignore")
+    if ch != "\033":
+        return ch
+    seq = ""
+    while len(seq) < 8:                          # drain the rest of the sequence
+        if not select.select([fd], [], [], 0.02)[0]:
+            break
+        seq += os.read(fd, 1).decode(errors="ignore")
+        if seq[-1].isalpha() or seq[-1] == "~":
+            break
+    return KEYS.get(seq, "esc" if not seq else "unknown")
+
+
+def set_input_mode(fd):
+    """Char-at-a-time input with no echo, but keep output post-processing on.
+
+    Plain tty.setraw() also clears OPOST, which stops "\\n" from implying a
+    carriage return — every line then starts where the last one ended.
+    """
+    tty.setraw(fd)
+    attrs = termios.tcgetattr(fd)
+    attrs[1] |= termios.OPOST | termios.ONLCR      # oflag
+    termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+
+
+# --------------------------------------------------------------------------
+# Setup. Every step below is a check plus the smallest action that satisfies
+# it, so running the wizard repeatedly is safe: satisfied steps are skipped
+# and only what is actually missing gets done.
+
+ACCESS_RULE = "/etc/udev/rules.d/42-mx4ctl.rules"
+PACKAGED_RULE = "/usr/lib/udev/rules.d/42-mx4ctl.rules"
+RECONNECT_RULE = "/etc/udev/rules.d/43-mx4ctl-restore.rules"
+BIN_LINK = pathlib.Path.home() / ".local" / "bin" / "mx4-wizard"
+
+ACCESS_RULE_TEXT = (
+    '# Logitech HID++ devices readable by the logged-in user (mx4ctl / mx4-wizard)\n'
+    'ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", MODE="0660", TAG+="uaccess"\n'
+    'ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:046D:*", MODE="0660", TAG+="uaccess"\n'
+)
+RECONNECT_RULE_TEXT = (
+    '# DPI is volatile and is lost whenever the mouse drops its connection\n'
+    '# (receiver replugged, moved to a dock, ...) — replay the saved settings.\n'
+    'ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", TAG+="systemd", '
+    f'ENV{{SYSTEMD_USER_WANTS}}+="{UNIT_NAME}"\n'
+)
+
+
+def blocked_nodes():
+    """Logitech HID++ nodes that exist but which we cannot open."""
+    return [n for n in hidpp.candidate_nodes() if not os.access(n, os.R_OK | os.W_OK)]
+
+
+def file_mentions(path, needle):
+    try:
+        return needle in open(path).read()
+    except OSError:
+        return False
+
+
+def unit_enabled():
+    r = subprocess.run(["systemctl", "--user", "is-enabled", UNIT_NAME],
+                       capture_output=True, text=True)
+    return r.stdout.strip() == "enabled"
+
+
+def write_unit():
+    UNIT.parent.mkdir(parents=True, exist_ok=True)
+    UNIT.write_text(f"""[Unit]
+Description=Restore MX Master 4 settings
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart={here}/mx4-wizard --restore
+
+[Install]
+WantedBy=graphical-session.target
+""")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    subprocess.run(["systemctl", "--user", "enable", UNIT_NAME], capture_output=True)
+
+
+def link_into_path():
+    BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
+    if BIN_LINK.is_symlink() or BIN_LINK.exists():
+        BIN_LINK.unlink()
+    BIN_LINK.symlink_to(here / "mx4-wizard")
+
+
+class Step:
+    """One setup step: a check, plus how to satisfy it."""
+
+    def __init__(self, title, ok, detail_ok, detail_missing,
+                 root_script=None, user_fix=None):
+        self.title, self._ok = title, ok
+        self.detail_ok, self.detail_missing = detail_ok, detail_missing
+        self.root_script, self.user_fix = root_script, user_fix
+
+    @property
+    def done(self):
+        return self._ok()
+
+    @property
+    def fixable(self):
+        return self.root_script is not None or self.user_fix is not None
+
+
+def setup_steps():
+    return [
+        Step(
+            "device access",
+            lambda: not blocked_nodes(),
+            "hidraw node is readable",
+            "hidraw node is root-only",
+            # the rules match ACTION=="add", so they must be replayed with
+            # --action=add; a bare `udevadm trigger` sends change events and
+            # silently does nothing
+            root_script=f"""
+if [ ! -e {ACCESS_RULE} ] && [ ! -e {PACKAGED_RULE} ]; then
+    cat > {ACCESS_RULE} <<'RULE'
+{ACCESS_RULE_TEXT}RULE
+fi
+udevadm control --reload-rules
+udevadm trigger --action=add --subsystem-match=hidraw
+""",
+        ),
+        Step(
+            "restore on reconnect",
+            lambda: any(file_mentions(p, UNIT_NAME)
+                        for p in (RECONNECT_RULE, ACCESS_RULE, PACKAGED_RULE)),
+            "udev rule installed",
+            "settings will not come back when the receiver is replugged",
+            root_script=f"""
+cat > {RECONNECT_RULE} <<'RULE'
+{RECONNECT_RULE_TEXT}RULE
+udevadm control --reload-rules
+""",
+        ),
+        Step(
+            "restore at login",
+            lambda: UNIT.exists() and unit_enabled(),
+            f"{UNIT_NAME} enabled",
+            "saved settings will not be re-applied at login",
+            user_fix=write_unit,
+        ),
+        Step(
+            "on PATH",
+            lambda: BIN_LINK.is_symlink() or BIN_LINK.exists(),
+            f"{BIN_LINK}",
+            "run it as ./mx4-wizard, or link it",
+            user_fix=link_into_path,
+        ),
+        Step(
+            "settings saved",
+            CONF.exists,
+            str(CONF),
+            "nothing saved yet — press `s` in the wizard",
+        ),
+    ]
+
+
+def run_setup(interactive=True, always_report=False):
+    """Report each step, then complete the ones that are missing."""
+    steps = setup_steps()
+    states = [(s, s.done) for s in steps]
+    missing = [s for s, done in states if not done and s.fixable]
+
+    if all(done for _, done in states) and not always_report:
+        return True
+    if not interactive:
+        return not missing
+
+    print(f"\n  {BOLD}Setup{OFF}")
+    for s, done in states:
+        tick = f"{GREEN}✓{OFF}" if done else f"{YELLOW}✗{OFF}"
+        detail = s.detail_ok if done else s.detail_missing
+        print(f"    {tick} {s.title:<22} {DIM}{detail}{OFF}")
+
+    if not missing:
+        print()
+        return True
+
+    root_steps = [s for s in missing if s.root_script]
+    print(f"\n  {len(missing)} step(s) to complete"
+          + (" (one sudo for the system ones)" if root_steps else "") + ".")
+    if input("  Do it now? [Y/n] ").strip().lower() not in ("", "y"):
+        print("  Skipped — nothing changed.\n")
+        return False
+
+    for s in missing:
+        if s.user_fix:
+            s.user_fix()
+            print(f"    {GREEN}✓{OFF} {s.title}")
+
+    if root_steps:
+        script = "set -e\n" + "".join(s.root_script for s in root_steps)
+        if subprocess.run(["sudo", "sh", "-c", script]).returncode != 0:
+            print(f"  {YELLOW}sudo step failed — rerun the wizard to retry.{OFF}\n")
+            return False
+        for s in root_steps:
+            print(f"    {GREEN}✓{OFF} {s.title}")
+    print()
+    return True
+
+
+def connect(interactive=True):
+    """Find the mouse, completing any missing setup first."""
+    import time
+    try:
+        return MX4(hidpp.find_device())
+    except (hidpp.DeviceNotFound, PermissionError):
+        pass
+
+    if blocked_nodes() and interactive:
+        for _ in range(10):                      # udev settles asynchronously
+            time.sleep(0.3)
+            try:
+                return MX4(hidpp.find_device())
+            except (hidpp.DeviceNotFound, PermissionError):
+                continue
+
+    if blocked_nodes():
+        sys.exit(f"mx4-wizard: no permission on {', '.join(blocked_nodes())}\n"
+                 "Unplug and replug the receiver (or re-login) and try again.")
+    sys.exit("mx4-wizard: no MX Master 4 found.\n"
+             "Is the mouse switched on and paired (receiver plugged, or Bluetooth)?")
+
+
+def main():
+    if "--restore" in sys.argv:
+        return restore()
+    if "--check" in sys.argv:
+        steps = setup_steps()
+        for s in steps:
+            done = s.done
+            print(f"{'ok  ' if done else 'MISS'}  {s.title:<22} "
+                  f"{s.detail_ok if done else s.detail_missing}")
+        return 0 if all(s.done for s in steps) else 1
+
+    setup_only = "--setup" in sys.argv
+    run_setup(always_report=setup_only)
+    if setup_only:
+        return 0
+
+    mouse = connect()
+
+    w = Wizard(mouse)
+    sel, message = 0, ""
+    fd = sys.stdin.fileno()
+    saved_term = termios.tcgetattr(fd)
+    sys.stdout.write("\033[?25l")               # hide cursor
+    try:
+        set_input_mode(fd)
+        while True:
+            draw(w, sel, message)
+            message = ""
+            key = read_key(fd)
+            try:
+                if key in ("q", "\x03"):
+                    break
+                if key == "esc":
+                    w.revert()
+                    message = "reverted"
+                    break
+                if key == "s":
+                    message = save(w)
+                elif key == "up":
+                    sel = (sel - 1) % len(w.rows)
+                elif key == "down":
+                    sel = (sel + 1) % len(w.rows)
+                elif key in ("right", "+", "="):
+                    w.rows[sel].adjust(+1)
+                elif key in ("left", "-", "_"):
+                    w.rows[sel].adjust(-1)
+                elif key == "sright":
+                    w.rows[sel].adjust(+1, big=True)
+                elif key == "sleft":
+                    w.rows[sel].adjust(-1, big=True)
+            except Exception as e:              # a rejected value shouldn't kill the UI
+                message = f"{YELLOW}{e}{OFF}"
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved_term)
+        sys.stdout.write("\033[?25h\n")         # show cursor
+
+    s = w.snapshot()
+    state = "ratchet" if s["mode"] == RATCHET else "freespin"
+    dis = "off" if s["speed"] == SPEED_OFF else s["speed"]
+    print(f"dpi {s['dpi']} · wheel {state}, torque {s['torque']}, auto-disengage {dis} "
+          f"· force {s['force']} · haptic {s['haptic']}")
+    if message:
+        print(message)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
