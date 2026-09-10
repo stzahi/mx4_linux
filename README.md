@@ -1,14 +1,8 @@
 # Logitech MX Master 4 haptics & extras for Linux
 
+<img width="758" alt="The actions ring: round buttons on a circle around the cursor, one highlighted, brightness and volume showing their level as an arc" src="https://github.com/user-attachments/assets/2c4d306b-e3c2-4c25-8112-92daa58afb30" />
 
-
-### Video of Haptic ring:
-https://drive.google.com/file/d/1ji8Y-_C-DQhqgMJjItS5vpSsWWBnK9nZ/view
-
-### images of Haptic ring:
-<img width="758" height="471" alt="actions-ring" src="https://github.com/user-attachments/assets/2c4d306b-e3c2-4c25-8112-92daa58afb30" />
-
-
+The actions ring on the thumb button — [see it in motion](https://drive.google.com/file/d/1ji8Y-_C-DQhqgMJjItS5vpSsWWBnK9nZ/view).
 
 The MX Master 4's headline features (haptic feedback, the thumb-panel
 "Actions Ring" button) only work with Logi Options+, which doesn't exist on
@@ -132,7 +126,7 @@ The wizard is standalone — it needs no daemon, and works fine alongside one.
 ### As a package (recommended — Ubuntu 20.04+)
 
 Grab the latest `.deb` from the
-[releases page](https://github.com/A-Common-Guy/mx4_linux/releases) —
+[releases page](https://github.com/stzahi/mx4_linux/releases) —
 every push to `main` builds, tests and publishes one, with a changelog —
 or build it yourself:
 
